@@ -47,7 +47,7 @@ services:
     # 上游官方镜像，按清单列表摘要固定。
     image: ghcr.io/paperless-ngx/paperless-ngx:3.4.0@sha256:7c1d98afd200def9e2bad3a377d30829e8d486554b3c818995af5860114ea17f
     # 不写 user：s6 要 root 才能做初始化（建目录、改属主），起来后各服务自行降权。
-    # USERMAP_UID/GID 把容器里的 paperless 用户改成主人的 PUID/PGID，宿主上的文件就归主人。
+    # USERMAP_UID/GID 把容器里的 paperless 用户改成用户的 PUID/PGID，宿主上的文件就归用户。
     # 启动时把镜像自带的语言和卷里的 chi_sim 合并到 /usr/src/paperless/tessdata（升级镜像
     # 后就换成了新镜像的文件），TESSDATA_PREFIX 指向合并目录，再交回镜像自己的 /init。
     entrypoint:
@@ -73,23 +73,23 @@ services:
       PAPERLESS_DATA_DIR: /data
       PAPERLESS_MEDIA_ROOT: /media
       # 归档原件、OCR 件和索引都是 paperless 自己管理的数据，放插件数据目录；
-      # consume（导入后被吃掉原文件的目录）也放数据目录，不挂共享文件夹，避免主人的文件被误吃。
-      # 主人经网页或 API 上传；要批量导入时往宿主上的 ${WONTON_APP_DATA}/data/consume 放文件。
+      # consume（导入后被吃掉原文件的目录）也放数据目录，不挂共享文件夹，避免用户的文件被误吃。
+      # 用户经网页或 API 上传；要批量导入时往宿主上的 ${WONTON_APP_DATA}/data/consume 放文件。
       PAPERLESS_CONSUMPTION_DIR: /data/consume
       # 中英文都认。chi_sim 由 install-langs 放进 tessdata-extra 卷，启动时合并。
       PAPERLESS_OCR_LANGUAGE: chi_sim+eng
       PAPERLESS_REDIS: redis://broker:6379
       # 登录交给核心的身份提供方（webui.sso: oidc）：Paperless 官方支持 allauth 的
       # OpenID Connect（PAPERLESS_APPS 进 provider，PAPERLESS_SOCIALACCOUNT_PROVIDERS
-      # 指向核心注入的端点和客户端）。不认任何请求头身份，宿主进程直连容器冒充不了主人。
+      # 指向核心注入的端点和客户端）。不认任何请求头身份，宿主进程直连容器冒充不了用户。
       # 打开网页直接进 OIDC 登录：关掉用户名密码登录页并自动跳转。密码登录只在 Django
-      # admin 和 API token 上仍可用（上游设计），网关挡在前面，只有主人打得开。
+      # admin 和 API token 上仍可用（上游设计），网关挡在前面，只有用户打得开。
       USERMAP_UID: ${PUID}
       USERMAP_GID: ${PGID}
       # 不预建账号：allauth 按 OIDC 身份（sub）匹配已有 SocialAccount，对不上时建新号（用户名取
       # preferred_username，与注入的 WONTON_OWNER_NAME 同值）。重装不删数据时 SQLite 里的
       # SocialAccount 还在，登录认回同一账号，不会多出第二个账号。
-      # 角色来自 ID 令牌的 groups 声明（核心固定给主人发 ["owner"]）：每次登录按它同步，
+      # 角色来自 ID 令牌的 groups 声明（核心固定给用户发 ["owner"]）：每次登录按它同步，
       # 在就授超管。不靠“第一个登录的人”这种一次性判断，重装、以后多人登录都不会错。
       # init-superuser 不启用（没有 PAPERLESS_ADMIN_*），不会产生密码后门。
       PAPERLESS_APPS: allauth.socialaccount.providers.openid_connect
@@ -139,41 +139,34 @@ volumes:
 x-wonton:
   spec: "0.4"
   id: com.paperless-ngx.paperless-ngx
-  version: 0.1.0
+  version: 0.1.1
   kind: app
-  title: { zh: 文档归档, en: Paperless }
-  description: { zh: "扫描件、照片和 PDF 经 OCR 归档，中英文全文搜索", en: "OCR archive for scans, photos and PDFs with full-text search in Chinese and English" }
+  title: { en: Paperless-ngx }
+  description: { zh: "扫描件和 PDF 自动识别文字、归档，随时搜得到", en: "Scans and PDFs get recognized, filed and stay searchable" }
   icon: icon.png
   notices: [NOTICE]
-  category: documents
   screenshots: [screenshots/documents.png, screenshots/upload.png, screenshots/search.png]
   author: { name: geraldpeng6 }
   homepage: https://docs.paperless-ngx.com/
   # 应用（paperless-ngx）的许可证；Valkey（BSD-3-Clause）作为依赖分发。
   license: GPL-3.0-only
-  tags: [paperless, 文档, OCR, 归档, 搜索, 扫描, DMS]
+  tags:
+    zh: [文档]
+    en: [Documents]
   about:
     zh: |
-      把扫描件、照片和 PDF 变成可全文搜索的文档库。
+      扫描件、照片和 PDF 进来后自动识别文字并归档，之后按往来方、标签和保存路径找回来。中文、英文都认得。
 
-      上传或放入导入目录后自动 OCR（中文、英文），按往来方、标签和保存路径归档；原件照常保留，OCR 文本另存一份，随时导出。
-
-      第一次启动会联网下载中文语言包，之后离线可用。
-
-      不解析 Office 文档（Tika/Gotenberg），也没有给 Agent 的搜索工具。
+      第一次启动要联网下载中文语言包，之后离线可用。Office 文档不解析。
     en: |
-      Turn scans, photos and PDFs into a library you can search.
+      Scans, photos and PDFs are recognized and filed automatically, and later found again by correspondent, tag or storage path. Chinese and English are both supported.
 
-      Documents are OCR'd on import (Chinese and English) and filed by correspondent, tag and storage path; originals are kept, OCR text is archived alongside.
-
-      The first start downloads the Chinese language pack; afterwards it works offline.
-
-      Office documents (Tika/Gotenberg) are not parsed, and Agent search tools are not exposed.
-  release_notes: { zh: "第一版：OCR 归档与全文搜索。", en: First release }
-  # 应用是多架构镜像，但不带 GPU：OCR 靠 CPU，2G 内存是上游给 tesseract 的建议下限。
+      The first start downloads the Chinese language files; afterwards it works offline. Office documents are not read.
+  release_notes: { zh: 名字和说明更新。, en: Product name and description update. }
+  # 上游没写最低内存；本机空闲实测约 802M，取 1G。镜像支持 amd64 和 arm64（docker manifest inspect）。
   requirements:
     arch: [amd64, arm64]
-    memory: 2G
+    memory: 1G
   webui:
     service: web
     port: 8000
@@ -190,6 +183,9 @@ x-wonton:
       generate: { bytes: 32 }
   permissions:
     # install-langs 首次下载 chi_sim，语言缓存在 tessdata-extra 卷；删数据卸载后需重新下载。
+    # install-langs fetches chi_sim once; the data sits in the tessdata-extra volume and downloads again after a purge.
     # 出网权限按整个插件永久授予，不只覆盖安装服务。普通桥接网络允许宿主进程直连 web，
-    # 但 web 已不再认任何身份头，冒充不了主人。
+    # 但 web 已不再认任何身份头，冒充不了用户。
+    # Egress is granted to the whole plugin, not just the install service. The host can reach web over the bridge,
+    # but web trusts no identity header, so the host cannot impersonate the user.
     - network.egress
