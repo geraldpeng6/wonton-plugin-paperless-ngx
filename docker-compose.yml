@@ -1,0 +1,195 @@
+# Paperless-ngx 文档管理：扫描件、照片和 PDF 经 OCR 归档，中英文全文搜索。
+# 上游是单容器镜像（s6 起里头的 webserver/consumer/scheduler/worker），加一个 Valkey 做任务队列。
+services:
+  broker:
+    # 任务队列。Valkey 是 Redis 的开源继承者（BSD-3-Clause），兼容 paperless 需要的 Redis 协议。
+    image: valkey/valkey:8.1.11-alpine@sha256:2602ace2be6569bc2bbb06f873776516ab9089821525be34f4305c67eb9db02a
+    # 只被 paperless 访问；alpine 镜像自带 redis-cli，健康检查 ping 队列真可用。
+    # 只读根文件系统；显式给 /data 留可写卷，Valkey 的 RDB 保存也需要写盘。
+    read_only: true
+    volumes:
+      - broker-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 30s
+      timeout: 5s
+      start_period: 5s
+      start_interval: 2s
+
+  # 中文模型来自 tessdata_fast（Apache-2.0），由 Debian 语言包分发。
+  # 只把 chi_sim.traineddata 放进卷；镜像自带的语言随升级更新，缓存命中后不再下载。
+  # 必须是独立服务：web 的 s6 会在语言装好之前并发跑 init-search-index /
+  # init-llmindex-migrate，它们先做语言检查，顺序不对时首次启动必失败（实测 3.4.0）。
+  install-langs:
+    image: ghcr.io/paperless-ngx/paperless-ngx:3.4.0@sha256:7c1d98afd200def9e2bad3a377d30829e8d486554b3c818995af5860114ea17f
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        set -e
+        test -s /tessdata-extra/chi_sim.traineddata && exit 0
+        # 用 snapshot.debian.org 的永久地址取固定版本的 .deb（pool 会随发行版更新移走旧版本），
+        # 核对摘要后解包：apt-get update 要拉几十 MB 索引，出口慢时会超过核心 300 秒安装超时。
+        url=https://snapshot.debian.org/archive/debian/20261020T213255Z/pool/main/t/tesseract-lang/tesseract-ocr-chi-sim_4.1.0-2_all.deb
+        curl -fsSL --retry 3 --retry-all-errors -o /tmp/chi_sim.deb "$$url"
+        echo "035f20a3e317343c1b88f6db546225eda9b5857078729c009662e0b3e0fb5d57  /tmp/chi_sim.deb" | sha256sum -c -
+        dpkg-deb -x /tmp/chi_sim.deb /
+        rm /tmp/chi_sim.deb
+        mkdir -p /tessdata-extra
+        # 写临时文件再改名：cp 写到一半被打断不会留下被当成“装好了”的半截文件。
+        cp /usr/share/tesseract-ocr/5/tessdata/chi_sim.traineddata /tessdata-extra/.chi_sim.tmp
+        mv /tessdata-extra/.chi_sim.tmp /tessdata-extra/chi_sim.traineddata
+    volumes:
+      - tessdata-extra:/tessdata-extra
+    restart: "no"
+
+  web:
+    # 上游官方镜像，按清单列表摘要固定。
+    image: ghcr.io/paperless-ngx/paperless-ngx:3.4.0@sha256:7c1d98afd200def9e2bad3a377d30829e8d486554b3c818995af5860114ea17f
+    # 不写 user：s6 要 root 才能做初始化（建目录、改属主），起来后各服务自行降权。
+    # USERMAP_UID/GID 把容器里的 paperless 用户改成主人的 PUID/PGID，宿主上的文件就归主人。
+    # 启动时把镜像自带的语言和卷里的 chi_sim 合并到 /usr/src/paperless/tessdata（升级镜像
+    # 后就换成了新镜像的文件），TESSDATA_PREFIX 指向合并目录，再交回镜像自己的 /init。
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        set -e
+        rm -rf /usr/src/paperless/tessdata
+        mkdir -p /usr/src/paperless/tessdata
+        cp -a /usr/share/tesseract-ocr/5/tessdata/. /usr/src/paperless/tessdata/
+        cp -a /tessdata-extra/. /usr/src/paperless/tessdata/
+        export TESSDATA_PREFIX=/usr/src/paperless/tessdata
+        exec /init
+    depends_on:
+      broker:
+        condition: service_healthy
+      install-langs:
+        condition: service_completed_successfully
+    environment:
+      # 数据库选 SQLite：家里用，少一个有状态服务和一份凭据。要迁 PostgreSQL 得经
+      # 上游的导出再导入（PAPERLESS_DBHOST 等），不能直接换。
+      PAPERLESS_DBENGINE: sqlite
+      PAPERLESS_DATA_DIR: /data
+      PAPERLESS_MEDIA_ROOT: /media
+      # 归档原件、OCR 件和索引都是 paperless 自己管理的数据，放插件数据目录；
+      # consume（导入后被吃掉原文件的目录）也放数据目录，不挂共享文件夹，避免主人的文件被误吃。
+      # 主人经网页或 API 上传；要批量导入时往宿主上的 ${WONTON_APP_DATA}/data/consume 放文件。
+      PAPERLESS_CONSUMPTION_DIR: /data/consume
+      # 中英文都认。chi_sim 由 install-langs 放进 tessdata-extra 卷，启动时合并。
+      PAPERLESS_OCR_LANGUAGE: chi_sim+eng
+      PAPERLESS_REDIS: redis://broker:6379
+      # 登录交给核心的身份提供方（webui.sso: oidc）：Paperless 官方支持 allauth 的
+      # OpenID Connect（PAPERLESS_APPS 进 provider，PAPERLESS_SOCIALACCOUNT_PROVIDERS
+      # 指向核心注入的端点和客户端）。不认任何请求头身份，宿主进程直连容器冒充不了主人。
+      # 打开网页直接进 OIDC 登录：关掉用户名密码登录页并自动跳转。密码登录只在 Django
+      # admin 和 API token 上仍可用（上游设计），网关挡在前面，只有主人打得开。
+      USERMAP_UID: ${PUID}
+      USERMAP_GID: ${PGID}
+      # 不预建账号：allauth 按 OIDC 身份（sub）匹配已有 SocialAccount，对不上时建新号（用户名取
+      # preferred_username，与注入的 WONTON_OWNER_NAME 同值）。重装不删数据时 SQLite 里的
+      # SocialAccount 还在，登录认回同一账号，不会多出第二个账号。
+      # 角色来自 ID 令牌的 groups 声明（核心固定给主人发 ["owner"]）：每次登录按它同步，
+      # 在就授超管。不靠“第一个登录的人”这种一次性判断，重装、以后多人登录都不会错。
+      # init-superuser 不启用（没有 PAPERLESS_ADMIN_*），不会产生密码后门。
+      PAPERLESS_APPS: allauth.socialaccount.providers.openid_connect
+      # issuer 必须用核心注入的公开签发方地址（auth.<基础域名>），浏览器和容器看到同一个值；
+      # server_url 指向它后 allauth 走 /.well-known/openid-configuration 发现端点。
+      PAPERLESS_SOCIALACCOUNT_PROVIDERS: >-
+        {"openid_connect":{"OAUTH_PKCE_ENABLED":true,"SCOPE":["openid","profile","email","groups"],"APPS":[{"provider_id":"wonton","name":"Wonton","client_id":"${WONTON_OIDC_CLIENT_ID}","secret":"${WONTON_OIDC_CLIENT_SECRET}","settings":{"server_url":"${WONTON_OIDC_ISSUER}","fetch_userinfo":true,"uid_field":"sub","token_auth_method":"client_secret_basic"}}]}}
+      PAPERLESS_SOCIALACCOUNT_ALLOW_SIGNUPS: "true"
+      PAPERLESS_SOCIAL_AUTO_SIGNUP: "true"
+      # groups 声明里的 owner 授超管，并在每次登录时同步；没有该组就撤销。
+      PAPERLESS_SOCIAL_ACCOUNT_SYNC_GROUPS: "true"
+      PAPERLESS_SOCIAL_ACCOUNT_SYNC_SUPERUSER_GROUP: owner
+      # allauth 默认把回调地址写成 https；开发环境经网关上的是 http，注册的却是 http，
+      # 会对不上 Hydra 登记的 redirect_uri。设成非 https 后 allauth 用请求自身的协议，
+      # 由网关写回的 X-Forwarded-Proto 决定（生产是 https 时 Django 也认作安全）。
+      PAPERLESS_ACCOUNT_DEFAULT_HTTP_PROTOCOL: http
+      PAPERLESS_PROXY_SSL_HEADER: '["HTTP_X_FORWARDED_PROTO","https"]'
+      PAPERLESS_DISABLE_REGULAR_LOGIN: "true"
+      PAPERLESS_REDIRECT_LOGIN_TO_SSO: "true"
+      PAPERLESS_URL: ${WONTON_APP_URL}
+      PAPERLESS_TIME_ZONE: ${TZ}
+      # 上游 v3 起要求显式的 Django secret key；由核心生成保管（secrets），
+      # 不写死在 compose 里，保留数据重装沿用同一个值。
+      PAPERLESS_SECRET_KEY: ${WONTON_SECRET_SECRET_KEY}
+      # 导入目录里的子目录也扫描，子目录名当标签，方便按来源分目录投放。
+      PAPERLESS_CONSUMER_RECURSIVE: "true"
+      PAPERLESS_CONSUMER_SUBDIRS_AS_TAGS: "true"
+    volumes:
+      - ${WONTON_APP_DATA}/data:/data
+      - ${WONTON_APP_DATA}/media:/media
+      - tessdata-extra:/tessdata-extra
+    healthcheck:
+      # 首页跟随上游的登录重定向，确认页面可用；worker 还必须应答 ping。
+      # celery 以 paperless 身份跑，和 worker 同一个用户；root 跑会往数据目录写日志文件、留下 root 属主的文件。
+      test: ["CMD-SHELL", "curl -fsSL --max-time 5 http://127.0.0.1:8000/ >/dev/null && s6-setuidgid paperless celery --app paperless inspect ping --destination celery@$${HOSTNAME} | grep -q pong"]
+      interval: 60s
+      timeout: 15s
+      # 首次启动要迁移数据库、建索引，给足时间；就绪后尽快报健康。
+      start_period: 10m
+      start_interval: 10s
+    restart: unless-stopped
+
+volumes:
+  broker-data:
+  tessdata-extra:
+
+x-wonton:
+  spec: "0.4"
+  id: com.paperless-ngx.paperless-ngx
+  version: 0.1.0
+  kind: app
+  title: { zh: 文档归档, en: Paperless }
+  description: { zh: "扫描件、照片和 PDF 经 OCR 归档，中英文全文搜索", en: "OCR archive for scans, photos and PDFs with full-text search in Chinese and English" }
+  icon: icon.png
+  notices: [NOTICE]
+  category: documents
+  screenshots: [screenshots/documents.png, screenshots/upload.png, screenshots/search.png]
+  author: { name: geraldpeng6 }
+  homepage: https://docs.paperless-ngx.com/
+  # 应用（paperless-ngx）的许可证；Valkey（BSD-3-Clause）作为依赖分发。
+  license: GPL-3.0-only
+  tags: [paperless, 文档, OCR, 归档, 搜索, 扫描, DMS]
+  about:
+    zh: |
+      把扫描件、照片和 PDF 变成可全文搜索的文档库。
+
+      上传或放入导入目录后自动 OCR（中文、英文），按往来方、标签和保存路径归档；原件照常保留，OCR 文本另存一份，随时导出。
+
+      第一次启动会联网下载中文语言包，之后离线可用。
+
+      不解析 Office 文档（Tika/Gotenberg），也没有给 Agent 的搜索工具。
+    en: |
+      Turn scans, photos and PDFs into a library you can search.
+
+      Documents are OCR'd on import (Chinese and English) and filed by correspondent, tag and storage path; originals are kept, OCR text is archived alongside.
+
+      The first start downloads the Chinese language pack; afterwards it works offline.
+
+      Office documents (Tika/Gotenberg) are not parsed, and Agent search tools are not exposed.
+  release_notes: { zh: "第一版：OCR 归档与全文搜索。", en: First release }
+  # 应用是多架构镜像，但不带 GPU：OCR 靠 CPU，2G 内存是上游给 tesseract 的建议下限。
+  requirements:
+    arch: [amd64, arm64]
+    memory: 2G
+  webui:
+    service: web
+    port: 8000
+    # 打开网页跳到核心的身份提供方（Ory Hydra），回插件网页时已是登录态；用户名来自
+    # OIDC 的 preferred_username，与注入的 WONTON_OWNER_NAME 同值。
+    sso: oidc
+    oidc:
+      # allauth 的 OIDC 回调路径（上游固定为 /accounts/oidc/<provider_id>/login/callback/，
+      # provider_id 用下面的 wonton）。
+      redirect_paths: [/accounts/oidc/wonton/login/callback/]
+      token_endpoint_auth_method: client_secret_basic
+  secrets:
+    secret_key:
+      generate: { bytes: 32 }
+  permissions:
+    # install-langs 首次下载 chi_sim，语言缓存在 tessdata-extra 卷；删数据卸载后需重新下载。
+    # 出网权限按整个插件永久授予，不只覆盖安装服务。普通桥接网络允许宿主进程直连 web，
+    # 但 web 已不再认任何身份头，冒充不了主人。
+    - network.egress
