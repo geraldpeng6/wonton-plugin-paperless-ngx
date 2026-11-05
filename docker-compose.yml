@@ -21,17 +21,21 @@ services:
   # 必须是独立服务：web 的 s6 会在语言装好之前并发跑 init-search-index /
   # init-llmindex-migrate，它们先做语言检查，顺序不对时首次启动必失败（实测 3.4.0）。
   install-langs:
-    image: ghcr.io/paperless-ngx/paperless-ngx:3.4.0@sha256:7c1d98afd200def9e2bad3a377d30829e8d486554b3c818995af5860114ea17f
+    image: ghcr.io/paperless-ngx/paperless-ngx:3.4.2@sha256:d704e84f88300eb6ab001ab15720a2330ff99169cf9f94d6b8fcc44b63a84c84
     entrypoint:
       - /bin/bash
       - -c
       - |
         set -e
         test -s /tessdata-extra/chi_sim.traineddata && exit 0
-        # 用 snapshot.debian.org 的永久地址取固定版本的 .deb（pool 会随发行版更新移走旧版本），
-        # 核对摘要后解包：apt-get update 要拉几十 MB 索引，出口慢时会超过核心 300 秒安装超时。
-        url=https://snapshot.debian.org/archive/debian/20261020T213255Z/pool/main/t/tesseract-lang/tesseract-ocr-chi-sim_4.1.0-2_all.deb
-        curl -fsSL --retry 3 --retry-all-errors -o /tmp/chi_sim.deb "$$url"
+        # 优先用 snapshot.debian.org 的永久地址取固定版本的 .deb（pool 会随发行版更新移走旧版本）；
+        # snapshot 故障（实测 2026-11-05 长时间 503/504）时退到 deb.debian.org 的 pool 路径。
+        # 两个来源下载后都核对同一个 sha256，文件不一致就失败，来源不改变信任属性。
+        # 不用 apt-get：update 要拉几十 MB 索引，出口慢时会超过核心 300 秒安装超时。
+        url1=https://snapshot.debian.org/archive/debian/20261020T213255Z/pool/main/t/tesseract-lang/tesseract-ocr-chi-sim_4.1.0-2_all.deb
+        url2=https://deb.debian.org/debian/pool/main/t/tesseract-lang/tesseract-ocr-chi-sim_4.1.0-2_all.deb
+        curl -fsSL --retry 3 --retry-all-errors -o /tmp/chi_sim.deb "$$url1" ||
+          curl -fsSL --retry 3 --retry-all-errors -o /tmp/chi_sim.deb "$$url2"
         echo "035f20a3e317343c1b88f6db546225eda9b5857078729c009662e0b3e0fb5d57  /tmp/chi_sim.deb" | sha256sum -c -
         dpkg-deb -x /tmp/chi_sim.deb /
         rm /tmp/chi_sim.deb
@@ -45,7 +49,7 @@ services:
 
   web:
     # 上游官方镜像，按清单列表摘要固定。
-    image: ghcr.io/paperless-ngx/paperless-ngx:3.4.0@sha256:7c1d98afd200def9e2bad3a377d30829e8d486554b3c818995af5860114ea17f
+    image: ghcr.io/paperless-ngx/paperless-ngx:3.4.2@sha256:d704e84f88300eb6ab001ab15720a2330ff99169cf9f94d6b8fcc44b63a84c84
     # 不写 user：s6 要 root 才能做初始化（建目录、改属主），起来后各服务自行降权。
     # USERMAP_UID/GID 把容器里的 paperless 用户改成用户的 PUID/PGID，宿主上的文件就归用户。
     # 启动时把镜像自带的语言和卷里的 chi_sim 合并到 /usr/src/paperless/tessdata（升级镜像
@@ -139,7 +143,7 @@ volumes:
 x-wonton:
   spec: "0.4"
   id: com.paperless-ngx.paperless-ngx
-  version: 0.1.1
+  version: 0.1.2
   kind: app
   title: { en: Paperless-ngx }
   description: { zh: "扫描件和 PDF 自动识别文字、归档，随时搜得到", en: "Scans and PDFs get recognized, filed and stay searchable" }
@@ -162,7 +166,7 @@ x-wonton:
       Scans, photos and PDFs are recognized and filed automatically, and later found again by correspondent, tag or storage path. Chinese and English are both supported.
 
       The first start downloads the Chinese language files; afterwards it works offline. Office documents are not read.
-  release_notes: { zh: 名字和说明更新。, en: Product name and description update. }
+  release_notes: { zh: "升级到上游 3.4.2：修复手机端保存按钮和文档详情的显示问题。", en: "Upgrade to upstream 3.4.2: fixes mobile save button and document detail display." }
   # 上游没写最低内存；本机空闲实测约 802M，取 1G。镜像支持 amd64 和 arm64（docker manifest inspect）。
   requirements:
     arch: [amd64, arm64]
