@@ -28,10 +28,14 @@ services:
       - |
         set -e
         test -s /tessdata-extra/chi_sim.traineddata && exit 0
-        # 用 snapshot.debian.org 的永久地址取固定版本的 .deb（pool 会随发行版更新移走旧版本），
-        # 核对摘要后解包：apt-get update 要拉几十 MB 索引，出口慢时会超过核心 300 秒安装超时。
-        url=https://snapshot.debian.org/archive/debian/20261020T213255Z/pool/main/t/tesseract-lang/tesseract-ocr-chi-sim_4.1.0-2_all.deb
-        curl -fsSL --retry 3 --retry-all-errors -o /tmp/chi_sim.deb "$$url"
+        # 优先用 snapshot.debian.org 的永久地址取固定版本的 .deb（pool 会随发行版更新移走旧版本）；
+        # snapshot 故障（实测 2026-11-05 长时间 503/504）时退到 deb.debian.org 的 pool 路径。
+        # 两个来源下载后都核对同一个 sha256，文件不一致就失败，来源不改变信任属性。
+        # 不用 apt-get：update 要拉几十 MB 索引，出口慢时会超过核心 300 秒安装超时。
+        url1=https://snapshot.debian.org/archive/debian/20261020T213255Z/pool/main/t/tesseract-lang/tesseract-ocr-chi-sim_4.1.0-2_all.deb
+        url2=https://deb.debian.org/debian/pool/main/t/tesseract-lang/tesseract-ocr-chi-sim_4.1.0-2_all.deb
+        curl -fsSL --retry 3 --retry-all-errors -o /tmp/chi_sim.deb "$$url1" ||
+          curl -fsSL --retry 3 --retry-all-errors -o /tmp/chi_sim.deb "$$url2"
         echo "035f20a3e317343c1b88f6db546225eda9b5857078729c009662e0b3e0fb5d57  /tmp/chi_sim.deb" | sha256sum -c -
         dpkg-deb -x /tmp/chi_sim.deb /
         rm /tmp/chi_sim.deb
