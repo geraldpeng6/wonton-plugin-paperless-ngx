@@ -1,6 +1,5 @@
+# shellcheck shell=bash
 # Paperless-ngx：sso=oidc（allauth）；清单没有 mcp。
-SSO=oidc
-MCP=0
 
 web_assert() { grep -qi 'paperless'; }   # 标准输入：应用真实页面
 
