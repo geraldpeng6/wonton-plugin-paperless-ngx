@@ -59,8 +59,16 @@ identity_check() {
     { echo "用户列表里没有用户超管：$users"; return 1; }
 }
 
+marker_file() { # SMOKE_STATE 在冒烟套件里是目录、在 e2e 里是文件，标记放它旁边，两种都能用
+	if [[ -d "$SMOKE_STATE" ]]; then
+		printf '%s' "$SMOKE_STATE/paperless-marker"
+	else
+		printf '%s' "${SMOKE_STATE}.paperless-marker"
+	fi
+}
+
 data_write() {
-  local base marker csrf resp
+  local base marker resp
   base="$(paperless_base)"
   paperless_login || return 1
   csrf="$(paperless_csrf)"
@@ -71,13 +79,13 @@ data_write() {
     --data-urlencode "name=$marker" "$base/api/tags/")" || { echo "建标签失败：$resp"; return 1; }
   jq -e --arg n "$marker" '.name == $n' <<<"$resp" >/dev/null 2>&1 ||
     { echo "标签没建成：$(head -c 200 <<<"$resp")"; return 1; }
-  printf '%s\n' "$marker" >"${SMOKE_STATE:?}"
+  printf '%s\n' "$marker" >"$(marker_file)"
 }
 
 data_check() {
   local base marker resp
   base="$(paperless_base)"
-  marker="$(cat "${SMOKE_STATE:-}" 2>/dev/null)"
+  marker="$(cat "$(marker_file)" 2>/dev/null)"
   [[ -n "$marker" ]] || { echo "SMOKE_STATE 标记文件是空的（data_write 没跑过？）"; return 1; }
   paperless_login || return 1
   resp="$(curl -sS --noproxy '*' --fail-with-body -b "${SMOKE_JAR:-}" -H 'Accept: application/json' \
