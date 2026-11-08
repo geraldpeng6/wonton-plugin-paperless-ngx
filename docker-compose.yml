@@ -118,6 +118,13 @@ services:
       # 上游 v3 起要求显式的 Django secret key；由核心生成保管（secrets），
       # 不写死在 compose 里，保留数据重装沿用同一个值。
       PAPERLESS_SECRET_KEY: ${WONTON_SECRET_SECRET_KEY}
+      # 发信走核心的内部邮箱（notify 权限注入这三个变量）：不认证、不加密。不填
+      # PAPERLESS_EMAIL_HOST_USER，Django 就不发 AUTH；USE_TLS/USE_SSL 上游默认就是关。
+      # 收件人只能是家里的人，外部地址在 SMTP 阶段被核心拒收（550），应用报发送失败。
+      # PAPERLESS_EMAIL_HOST 必须显式设：上游默认 localhost 会被当成“未启用发信”。
+      PAPERLESS_EMAIL_HOST: ${WONTON_SMTP_HOST}
+      PAPERLESS_EMAIL_PORT: ${WONTON_SMTP_PORT}
+      PAPERLESS_EMAIL_FROM: ${WONTON_MAIL_FROM}
       # 导入目录里的子目录也扫描，子目录名当标签，方便按来源分目录投放。
       PAPERLESS_CONSUMER_RECURSIVE: "true"
       PAPERLESS_CONSUMER_SUBDIRS_AS_TAGS: "true"
@@ -136,14 +143,60 @@ services:
       start_interval: 10s
     restart: unless-stopped
 
+  # 一次性初始化：已有账号的邮箱停在旧值（allauth 只在注册时写 email，登录不更新），
+  # 找回密码会寄去旧地址、出不了核心。web 健康后（迁移已完成）把主人账号的邮箱改成核心
+  # 注入的内部地址。每次容器重建都跑，幂等；新装时账号还没建（登录时 allauth 直接取声明
+  # 里的同一个地址），跳过即可，不算失败。主人账号按用户名认（allauth 用 preferred_username
+  # 建号，与 WONTON_OWNER_NAME 同值）。
+  # 与 web 共用数据卷；以 PUID 运行，SQLite 的日志文件不能落成 root 属主，否则 web 写不进。
+  init-owner-email:
+    image: ghcr.io/paperless-ngx/paperless-ngx:3.4.2@sha256:d704e84f88300eb6ab001ab15720a2330ff99169cf9f94d6b8fcc44b63a84c84
+    user: "${PUID}:${PGID}"
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        set -euo pipefail
+        cd /usr/src/paperless/src
+        python3 manage.py shell -c '
+        import os
+        from django.contrib.auth import get_user_model
+
+        target = os.environ["WONTON_OWNER_EMAIL"]
+        name = os.environ["WONTON_OWNER_NAME"]
+        user = get_user_model().objects.filter(username=name).first()
+        if user is None:
+            print("owner account does not exist yet, nothing to do")
+        elif user.email == target:
+            print("owner email already set, nothing to do")
+        else:
+            user.email = target
+            user.save(update_fields=["email"])
+            print("owner email updated to", target)
+        '
+    environment:
+      # 与 web 同一份配置，才能打开同一个 SQLite；不连队列，不挂媒体和语言目录。
+      PAPERLESS_DBENGINE: sqlite
+      PAPERLESS_DATA_DIR: /data
+      PAPERLESS_SECRET_KEY: ${WONTON_SECRET_SECRET_KEY}
+      PYTHONDONTWRITEBYTECODE: "1"
+      WONTON_OWNER_EMAIL: ${WONTON_OWNER_EMAIL}
+      WONTON_OWNER_NAME: ${WONTON_OWNER_NAME}
+    volumes:
+      - ${WONTON_APP_DATA}/data:/data
+    depends_on:
+      web:
+        condition: service_healthy
+    restart: "no"
+
 volumes:
   broker-data:
   tessdata-extra:
 
 x-wonton:
-  spec: "0.4"
+  spec: "0.11"
   id: com.paperless-ngx.paperless-ngx
-  version: 0.1.2
+  version: 0.1.3
   kind: app
   title: { en: Paperless-ngx }
   description: { zh: "扫描件和 PDF 自动识别文字、归档，随时搜得到", en: "Scans and PDFs get recognized, filed and stay searchable" }
@@ -164,13 +217,17 @@ x-wonton:
       第一次启动要联网下载中文语言包，之后离线可用。Office 文档不解析。
 
       核心升级后，插件容器会按新的签发方自动重建，打开照常，不用重装。
+
+      应用发的信（找回密码、把文档发给家里人）会出现在收件人的 Wonton 私聊里；外部邮箱收不到，会发送失败。
     en: |
       Scans, photos and PDFs are recognized and filed automatically, and later found again by correspondent, tag or storage path. Chinese and English are both supported.
 
       The first start downloads the Chinese language files; afterwards it works offline. Office documents are not read.
 
+      Mail sent by the app (password resets, emailing a document to family) arrives in the recipient's Wonton chat; external addresses fail.
+
       After a core upgrade the plugin's containers are rebuilt with the new issuer automatically; pages open as before, with nothing to reinstall.
-  release_notes: { zh: "升级到上游 3.4.2：修复手机端保存按钮和文档详情的显示问题。", en: "Upgrade to upstream 3.4.2: fixes mobile save button and document detail display." }
+  release_notes: { zh: "应用发的信改走云吞的内部邮箱：找回密码和把文档发人，信会出现在收件人的 Wonton 私聊里，外部邮箱发不出。已有账号的邮箱自动改成内部地址。", en: "App email now goes through the Wonton internal mailbox: password resets and emailed documents arrive in the recipient's Wonton chat, external addresses fail. Existing accounts get their email switched to the internal address automatically." }
   # 上游没写最低内存；本机空闲实测约 802M，取 1G。镜像支持 amd64 和 arm64（docker manifest inspect）。
   requirements:
     arch: [amd64, arm64]
@@ -197,3 +254,8 @@ x-wonton:
     # Egress is granted to the whole plugin, not just the install service. The host can reach web over the bridge,
     # but web trusts no identity header, so the host cannot impersonate the user.
     - network.egress
+    # 发信（找回密码、把文档发人）走核心的内部邮箱：notify 注入 WONTON_SMTP_* 和
+    # WONTON_MAIL_FROM，信转进收件人的 Wonton 私聊。
+    - notify
+    # 一次性初始化要拿主人的用户名和内部邮箱，把已有账号停在旧值的邮箱改成内部地址。
+    - owner.identity
