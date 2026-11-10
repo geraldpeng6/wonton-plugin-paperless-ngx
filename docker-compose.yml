@@ -162,10 +162,14 @@ x-wonton:
       扫描件、照片和 PDF 进来后自动识别文字并归档，之后按往来方、标签和保存路径找回来。中文、英文都认得。
 
       第一次启动要联网下载中文语言包，之后离线可用。Office 文档不解析。
+
+      核心升级后，插件容器会按新的签发方自动重建，打开照常，不用重装。
     en: |
       Scans, photos and PDFs are recognized and filed automatically, and later found again by correspondent, tag or storage path. Chinese and English are both supported.
 
       The first start downloads the Chinese language files; afterwards it works offline. Office documents are not read.
+
+      After a core upgrade the plugin's containers are rebuilt with the new issuer automatically; pages open as before, with nothing to reinstall.
   release_notes: { zh: "升级到上游 3.4.2：修复手机端保存按钮和文档详情的显示问题。", en: "Upgrade to upstream 3.4.2: fixes mobile save button and document detail display." }
   # 上游没写最低内存；本机空闲实测约 802M，取 1G。镜像支持 amd64 和 arm64（docker manifest inspect）。
   requirements:
