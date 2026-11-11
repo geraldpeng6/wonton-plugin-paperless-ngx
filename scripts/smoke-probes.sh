@@ -93,3 +93,62 @@ data_check() {
   jq -e --arg n "$marker" 'any(.results[]; .name == $n)' <<<"$resp" >/dev/null ||
     { echo "标记标签不见了：$(head -c 200 <<<"$resp")"; return 1; }
 }
+
+# ---------- 发信（notify，规范 0.11）----------
+pl_core() { # 核心容器：通知房记录、Matrix 令牌和 Tuwunel 都在它的数据目录/网络上
+	docker ps --format '{{.Names}}' | grep -xE "wonton-${SMOKE_INSTANCE:-}--core" | head -1
+}
+
+pl_dd() { # 核心数据目录（e2e 冒烟有 read_env；dev.sh probes 用 probes_setting）
+	if declare -F read_env >/dev/null; then read_env WONTON_DATA_DIR; else probes_setting WONTON_DATA_DIR; fi
+}
+
+pl_room_wait() { # <超时秒> <要找的文字>：等主人的「Wonton」私聊出现这段文字。用套件 probes.sh 的
+	# probes_owner_room_wait（随 main 的 kit 同步修），在独立进程里跑，套件的 pass/fail 不盖进冒烟自己的 shell。
+	local core dd pdir
+	core="$(pl_core)" || return 1
+	dd="$(pl_dd)"
+	pdir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+	# shellcheck disable=SC2016 # 单引号里是子进程 bash 的变量，$1/$2/$3 是 bash -c 的位置参数
+	env SMOKE_CORE="$core" SMOKE_DATA_DIR="$dd" SMOKE_OWNER="${SMOKE_OWNER:-owner}" \
+		bash -c 'source "$1/lib.sh" && source "$1/probes.sh" && probes_owner_room_wait "$2" "$3"' \
+		_ "$pdir" "$1" "$2"
+}
+
+extra_check() { # 发信端到端：应用自己的「文档发邮件」把一封真实邮件发给主人内部邮箱（应用自己的发信路径），
+	# 然后等核心把它投进主人的「Wonton」私聊（直接读通知房的消息，投递的最终证据）。
+	local base marker csrf doc resp to wp
+	base="$(paperless_base)"
+	to="${SMOKE_OWNER:-owner}@wonton.internal"
+	paperless_login || { echo "登录链没建立应用会话"; return 1; }
+	csrf="$(paperless_csrf)"
+	[[ -n "$csrf" ]] || { echo "登录后没有 csrftoken Cookie"; return 1; }
+	# 传一个带标记标题的文档（消费是异步的，轮询到入库为止），再用应用的邮件接口发给主人。
+	marker="wonton-mail-$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+	printf 'wonton e2e mail probe %s' "$marker" >"$(marker_file).mail"
+	resp="$(curl -sS --noproxy '*' --fail-with-body -b "${SMOKE_JAR:-}" -e "$base/" \
+		-H "X-CSRFToken: $csrf" -H 'Accept: application/json' \
+		-F "document=@$(marker_file).mail" -F "title=$marker" \
+		"$base/api/documents/post_document/")" ||
+		{ echo "传文档失败：$(head -c 200 <<<"$resp")"; return 1; }
+	for _ in 1 2 3 4 5 6 7 8 9 10; do
+		doc="$(curl -sS --noproxy '*' --fail-with-body -b "${SMOKE_JAR:-}" -H 'Accept: application/json' \
+			"$base/api/documents/")" || { echo "列文档失败：$(head -c 200 <<<"$doc")"; return 1; }
+		doc="$(jq -r --arg m "$marker" '[.results[] | select(.title == $m)][0].id // empty' <<<"$doc")"
+		[[ -n "$doc" ]] && break
+		sleep 5
+	done
+	[[ -n "$doc" ]] || { echo "文档 50 秒没入库（标题 $marker）"; return 1; }
+	# 等待先挂后台再触发（模板的用法）：信进私聊是秒级投递，先等后发才等得到；标记在主题里，旧信不会误配。
+	pl_room_wait 120 "$marker" & wp=$!
+	resp="$(curl -sS --noproxy '*' --fail-with-body -b "${SMOKE_JAR:-}" -e "$base/" \
+		-H "X-CSRFToken: $csrf" -H 'Content-Type: application/json' -H 'Accept: application/json' \
+		-d "$(jq -cn --arg to "$to" --arg m "$marker" --argjson d "$doc" \
+			'{documents:[$d],addresses:$to,subject:("wonton e2e "+$m),message:("wonton e2e mail probe "+$m)}')" \
+		"$base/api/documents/email/")" ||
+		{ kill "$wp" 2>/dev/null; wait "$wp" 2>/dev/null; echo "发信接口失败：$(head -c 200 <<<"$resp")"; return 1; }
+	grep -q 'Email sent\|sent' <<<"$resp" || { kill "$wp" 2>/dev/null; wait "$wp" 2>/dev/null; echo "应用报发送失败：$(head -c 200 <<<"$resp")"; return 1; }
+	# 核心把信投进主人的「Wonton」私聊：房里出现这一封（标记在主题里）。
+	wait "$wp" || { echo "文档邮件 120 秒没出现在主人的 Wonton 私聊（房里没这封信）"; return 1; }
+	echo "文档邮件已进主人的 Wonton 私聊（Paperless-ngx：wonton e2e $marker）"
+}
