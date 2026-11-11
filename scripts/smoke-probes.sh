@@ -117,11 +117,22 @@ pl_mailpit() { # <path>：调 Mailpit API（basic core:<密码>）。主路照�
 		"http://smtp.wonton.internal:8025$1" 2>&1
 }
 
-pl_mailpit_wait() { # <jq 过滤> [次数=20]：轮询 Mailpit 直到过滤命中
-	local filt="$1" n="${2:-20}" i out
+pl_mailpit_wait() { # <from> <to> [次数=20]：等一封 From/To 对上的信进 Mailpit
+	local from="$1" to="$2" n="${3:-20}" i out
 	for ((i = 0; i < n; i++)); do
 		out="$(pl_mailpit "/api/v1/messages?limit=100")" || { sleep 3; continue; }
-		jq -e "$filt" <<<"$out" >/dev/null 2>&1 && return 0
+		jq -e --arg f "$from" --arg t "$to" \
+			'.messages | any(.From.Address == $f and any(.To[]; .Address == $t))' <<<"$out" >/dev/null 2>&1 && return 0
+		sleep 3
+	done
+	return 1
+}
+
+pl_mailpit_wait_gone() { # <to> [次数=20]：等收件人的信从 Mailpit 里消失（核心投进私聊后会把信删掉）
+	local to="$1" n="${2:-20}" i out
+	for ((i = 0; i < n; i++)); do
+		out="$(pl_mailpit "/api/v1/messages?limit=100")" || { sleep 3; continue; }
+		jq -e --arg t "$to" '(.messages | map(select(.To[].Address == $t)) | length) == 0' <<<"$out" >/dev/null 2>&1 && return 0
 		sleep 3
 	done
 	return 1
@@ -158,13 +169,11 @@ extra_check() { # 发信端到端：应用自己的「文档发邮件」把一�
 		{ echo "发信接口失败：$(head -c 200 <<<"$resp")"; return 1; }
 	grep -q 'Email sent\|sent' <<<"$resp" || { echo "应用报发送失败：$(head -c 200 <<<"$resp")"; return 1; }
 	# 信进内部邮箱：From 是 WONTON_MAIL_FROM（com.paperless-ngx.paperless-ngx@plugins.wonton.internal）。
-	pl_mailpit_wait "$(jq -n --arg to "$to" \
-		'.messages | any(.From.Address == "com.paperless-ngx.paperless-ngx@plugins.wonton.internal" and any(.To[].Address == $to))')" 20 ||
+	pl_mailpit_wait "com.paperless-ngx.paperless-ngx@plugins.wonton.internal" "$to" 20 ||
 		{ echo "邮件 60 秒没进 Mailpit：$(pl_mailpit '/api/v1/messages?limit=5' | head -c 300)"; return 1; }
 	echo "文档邮件已进内部邮箱（To=$to）"
 	# 核心投进收件人私聊后把信从 Mailpit 删掉：信箱里没有这封信 = 已投递。
-	pl_mailpit_wait "$(jq -n --arg to "$to" \
-		'(.messages | map(select(.To[].Address == $to)) | length) == 0')" 20 ||
+	pl_mailpit_wait_gone "$to" 20 ||
 		{ echo "邮件一直留在 Mailpit：核心没把它投进主人私聊（投完才会删）"; return 1; }
 	echo "核心已把信投进主人的 Wonton 私聊（Mailpit 里已删除）"
 }
