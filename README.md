@@ -1,6 +1,6 @@
 # 云吞插件：Paperless-ngx 文档管理
 
-开发流程见[插件开发指南](https://github.com/geraldpeng6/wonton-docs/blob/main/develop.md)。
+开发流程见[插件开发指南](https://github.com/wontonapp/wonton-docs/blob/main/develop.md)。
 
 [Paperless-ngx](https://docs.paperless-ngx.com/) 做成插件：扫描件、照片和 PDF 上传后 OCR（中文、英文），
 按往来方、标签和保存路径归档，全文搜索。原件、OCR 件和索引在数据目录 `${WONTON_APP_DATA}/{data,media}`，批量导入往
