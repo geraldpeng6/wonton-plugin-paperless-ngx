@@ -93,3 +93,78 @@ data_check() {
   jq -e --arg n "$marker" 'any(.results[]; .name == $n)' <<<"$resp" >/dev/null ||
     { echo "标记标签不见了：$(head -c 200 <<<"$resp")"; return 1; }
 }
+
+# ---------- 发信（notify，规范 0.11）----------
+pl_core() { # 核心容器：Mailpit 的别名和 API 密码都在它的网络上/数据目录里
+	docker ps --format '{{.Names}}' | grep -xE "wonton-${SMOKE_INSTANCE:-}--core" | head -1
+}
+
+pl_mailpit() { # <path>：调 Mailpit API（basic core:<密码>）。主路照核心自己的冒烟：在核心网络里
+	# 打 mailpit.wonton.internal:8025；兜底用应用容器的 wget（它的网络里也有这个别名）。
+	local core pw dd out webc
+	core="$(pl_core)" || return 1
+	if declare -F read_env >/dev/null; then dd="$(read_env WONTON_DATA_DIR)"; else dd="$(probes_setting WONTON_DATA_DIR)"; fi
+	pw="$(docker exec "$core" cat "$dd/core/mailpit/api-password" 2>/dev/null)"
+	[[ -n "${pw:-}" ]] || { echo "读不到 Mailpit API 密码（核心数据目录 core/mailpit/api-password）"; return 1; }
+	out="$(docker run --rm --network "container:$core" curlimages/curl:8.23.0 \
+		-s -u "core:$pw" "http://mailpit.wonton.internal:8025$1" 2>&1)"
+	if jq -e '.messages' <<<"$out" >/dev/null 2>&1 || [[ "$out" == "{"* ]]; then
+		printf '%s' "$out"; return 0
+	fi
+	webc="$(docker ps --format '{{.Names}}' | grep "$SMOKE_INSTANCE" | grep 'paperless' | head -1)"
+	[[ -n "$webc" ]] || { echo "Mailpit 主路没拿到 JSON：$(head -c 200 <<<"$out")"; return 1; }
+	docker exec "$webc" wget -qO- --header "Authorization: Basic $(printf 'core:%s' "$pw" | base64 | tr -d '\n')" \
+		"http://smtp.wonton.internal:8025$1" 2>&1
+}
+
+pl_mailpit_wait() { # <jq 过滤> [次数=20]：轮询 Mailpit 直到过滤命中
+	local filt="$1" n="${2:-20}" i out
+	for ((i = 0; i < n; i++)); do
+		out="$(pl_mailpit "/api/v1/messages?limit=100")" || { sleep 3; continue; }
+		jq -e "$filt" <<<"$out" >/dev/null 2>&1 && return 0
+		sleep 3
+	done
+	return 1
+}
+
+extra_check() { # 发信端到端：应用自己的「文档发邮件」把一封真实邮件发进内部邮箱，核心投进主人私聊后取走删除
+	local base marker csrf doc resp to
+	base="$(paperless_base)"
+	to="${SMOKE_OWNER:-owner}@wonton.internal"
+	paperless_login || { echo "登录链没建立应用会话"; return 1; }
+	csrf="$(paperless_csrf)"
+	[[ -n "$csrf" ]] || { echo "登录后没有 csrftoken Cookie"; return 1; }
+	# 传一个带标记标题的文档（消费是异步的，轮询到入库为止），再用应用的邮件接口发给主人。
+	marker="wonton-mail-$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+	printf 'wonton e2e mail probe %s' "$marker" >"$(marker_file).mail"
+	resp="$(curl -sS --noproxy '*' --fail-with-body -b "${SMOKE_JAR:-}" -e "$base/" \
+		-H "X-CSRFToken: $csrf" -H 'Accept: application/json' \
+		-F "document=@$(marker_file).mail" -F "title=$marker" \
+		"$base/api/documents/post_document/")" ||
+		{ echo "传文档失败：$(head -c 200 <<<"$resp")"; return 1; }
+	for _ in 1 2 3 4 5 6 7 8 9 10; do
+		doc="$(curl -sS --noproxy '*' --fail-with-body -b "${SMOKE_JAR:-}" -H 'Accept: application/json' \
+			"$base/api/documents/")" || { echo "列文档失败：$(head -c 200 <<<"$doc")"; return 1; }
+		doc="$(jq -r --arg m "$marker" '[.results[] | select(.title == $m)][0].id // empty' <<<"$doc")"
+		[[ -n "$doc" ]] && break
+		sleep 5
+	done
+	[[ -n "$doc" ]] || { echo "文档 50 秒没入库（标题 $marker）"; return 1; }
+	resp="$(curl -sS --noproxy '*' --fail-with-body -b "${SMOKE_JAR:-}" -e "$base/" \
+		-H "X-CSRFToken: $csrf" -H 'Content-Type: application/json' -H 'Accept: application/json' \
+		-d "$(jq -cn --arg to "$to" --arg m "$marker" --argjson d "$doc" \
+			'{documents:[$d],addresses:$to,subject:("wonton e2e "+$m),message:("wonton e2e mail probe "+$m)}')" \
+		"$base/api/documents/email/")" ||
+		{ echo "发信接口失败：$(head -c 200 <<<"$resp")"; return 1; }
+	grep -q 'Email sent\|sent' <<<"$resp" || { echo "应用报发送失败：$(head -c 200 <<<"$resp")"; return 1; }
+	# 信进内部邮箱：From 是 WONTON_MAIL_FROM（com.paperless-ngx.paperless-ngx@plugins.wonton.internal）。
+	pl_mailpit_wait "$(jq -n --arg to "$to" \
+		'.messages | any(.From.Address == "com.paperless-ngx.paperless-ngx@plugins.wonton.internal" and any(.To[].Address == $to))')" 20 ||
+		{ echo "邮件 60 秒没进 Mailpit：$(pl_mailpit '/api/v1/messages?limit=5' | head -c 300)"; return 1; }
+	echo "文档邮件已进内部邮箱（To=$to）"
+	# 核心投进收件人私聊后把信从 Mailpit 删掉：信箱里没有这封信 = 已投递。
+	pl_mailpit_wait "$(jq -n --arg to "$to" \
+		'(.messages | map(select(.To[].Address == $to)) | length) == 0')" 20 ||
+		{ echo "邮件一直留在 Mailpit：核心没把它投进主人私聊（投完才会删）"; return 1; }
+	echo "核心已把信投进主人的 Wonton 私聊（Mailpit 里已删除）"
+}
